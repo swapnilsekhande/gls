@@ -4,6 +4,7 @@ import (
 	"datalogger/databases"
 	"datalogger/models"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,16 +14,15 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/robfig/cron/v3"
 	logrus "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 func initLogger() {
-	// Create log file
 	file, err := os.OpenFile("plc.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Println("❌ Failed to open log file:", err)
 		os.Exit(1)
 	}
-
 	logrus.SetOutput(io.MultiWriter(os.Stdout, file))
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
@@ -43,12 +43,12 @@ func main() {
 
 	}
 	c := cron.New(cron.WithSeconds())
-	_, err = c.AddFunc("*/30 * * * * *", func() {
+	_, err = c.AddFunc("*/10 * * * * *", func() {
 		logrus.Println("⏱ Task triggered at:", time.Now().Format("15:04:05"))
 		if err != nil {
 			logrus.Errorf("Error Machine Data Logging : %v", err)
 		}
-		machinesDataLog()
+		machinesDataLogNew()
 	})
 	if err != nil {
 		logrus.Error(err)
@@ -59,7 +59,6 @@ func main() {
 }
 
 const (
-	// MASTERS
 	CountAddr  = 40361
 	REC0Pulse  = 40362
 	REC1Pulse  = 40363
@@ -90,17 +89,16 @@ func readRecord(client modbus.Client, startAddress uint16, length uint16) ([]uin
 }
 
 func writePulse(client modbus.Client, address uint16, value uint16) error {
-	_, err := client.WriteSingleCoil(address-40001, value)
+	_, err := client.WriteSingleRegister(address-40001, value)
 	return err
 }
 
-func machinesDataLog() error {
+func machinesDataLogNew() error {
 	var machines []models.Machine
 	err := databases.DiantaDB.Find(&machines).Error
 	if err != nil {
 		return err
 	}
-
 	for i, machine := range machines {
 		logrus.Printf("Machine Processed: %d", i)
 		handler := modbus.NewTCPClientHandler(fmt.Sprintf("%s:%s", machine.MachineIP, machine.MachinePort))
@@ -124,96 +122,48 @@ func machinesDataLog() error {
 		if count == 0 {
 			continue
 		}
-
-		// Process REC0 first
-		rec0Read := 0
-		rec0ReadInt, err := readUint16(client, REC0Pulse)
-		if err != nil {
-			logrus.Errorf("❌ REC0 pulse read error: %v", err)
-			continue
-		}
-		rec0Read = int(rec0ReadInt + 1)
-		for rec0Read <= 242 && rec0Read < int(count) {
-			err = writePulse(client, REC0Pulse, uint16(rec0Read))
+		// === REC0 Logging ===
+		for i := 1; i <= 242; i++ {
+			logrus.Printf("---------------------------\n REC0 %d ---------------------------\n", i)
+			// First write to REC0Pulse to trigger record load
+			if err := writePulse(client, REC0Pulse, uint16(i)); err != nil {
+				logrus.Warnf("⚠️ Failed to write REC0 pulse at %d: %v", i, err)
+				continue
+			}
+			record, err := readRecord(client, REC0_ADDR, RECORD_LEN)
 			if err != nil {
-				logrus.Errorf("❌ REC0 pulse write error: %v", err)
-				break
+				logrus.Errorf("⚠️ REC0 Read Failed at index %d: %v", i, err)
+				continue
 			}
-			time.Sleep(300 * time.Millisecond)
-
-			rec0, err := readRecord(client, REC0_ADDR, RECORD_LEN)
-			if err != nil {
-				logrus.Errorf("❌ Error reading REC0: %v", err)
-				err = writePulse(client, REC0Pulse, uint16(rec0Read-1))
-				if err != nil {
-					logrus.Errorf("❌ REC0 pulse write error: %v", err)
-					break
-				}
-				break
+			if isRecordEmpty(record) {
+				continue
 			}
-			if !isRecordEmpty(rec0) {
-				if _, err := storeMasterDB(rec0, int(machine.ID)); err != nil {
-					logrus.Errorf("Error storing REC0 to DB: %v", err)
-					err = writePulse(client, REC0Pulse, uint16(rec0Read-1))
-					if err != nil {
-						logrus.Errorf("❌ REC0 pulse write error: %v", err)
-						break
-					}
-					break
-				}
-				logrus.Infof("✅ REC0 record %d stored successfully", rec0Read+1)
-			} else {
-				logrus.Warnf("⚠️ REC0 record %d skipped: Empty timestamp", rec0Read+1)
+			if _, err := storeMasterDB(record, int(machine.ID)); err != nil {
+				logrus.Errorf("❌ Failed to store REC0 record: %v", err)
+				continue
 			}
-			rec0Read++
 		}
 
-		// Process REC1
-		rec1Read := 0
-		rec1ReadInt, err := readUint16(client, REC1Pulse)
-		if err != nil {
-			logrus.Errorf("❌ REC1 pulse read error: %v", err)
-			continue
-		}
-		rec1Read = int(rec1ReadInt + 1)
-		remaining := int(count) - rec0Read
-		for rec1Read <= 242 && rec1Read < remaining {
-			err = writePulse(client, REC1Pulse, uint16(rec1Read))
+		// === REC1 Logging ===
+		for i := 1; i <= 242; i++ {
+			logrus.Printf("---------------------------\n REC1 %d ---------------------------\n", i)
+			if err := writePulse(client, REC1Pulse, uint16(i)); err != nil {
+				logrus.Warnf("⚠️ Failed to write REC1 pulse at %d: %v", i, err)
+				continue
+			}
+			time.Sleep(100 * time.Millisecond)
+			record, err := readRecord(client, REC1_ADDR, RECORD_LEN)
 			if err != nil {
-				logrus.Errorf("❌ REC1 pulse write error: %v", err)
-				break
+				logrus.Errorf("⚠️ REC1 Read Failed at index %d: %v", i, err)
+				continue
 			}
-			time.Sleep(300 * time.Millisecond)
-			rec1, err := readRecord(client, REC1_ADDR, RECORD_LEN)
-			if err != nil {
-				logrus.Errorf("❌ Error reading REC1: %v", err)
-				err = writePulse(client, REC1Pulse, uint16(rec1Read-1))
-				if err != nil {
-					logrus.Errorf("❌ REC1 pulse write error: %v", err)
-					break
-				}
-				break
+			if isRecordEmpty(record) {
+				continue
 			}
-			if !isRecordEmpty(rec1) {
-				if _, err := storeMasterDB(rec1, int(machine.ID)); err != nil {
-					logrus.Errorf("Error storing REC1 to DB: %v", err)
-					err = writePulse(client, REC0Pulse, uint16(rec1Read-1))
-					if err != nil {
-						logrus.Errorf("❌ REC0 pulse write error: %v", err)
-						break
-					}
-					break
-				}
-				logrus.Infof("✅ REC1 record %d stored successfully", rec1Read+1)
-			} else {
-				logrus.Warnf("⚠️ REC1 record %d skipped: Empty timestamp", rec1Read+1)
+			if _, err := storeMasterDB(record, int(machine.ID)); err != nil {
+				logrus.Errorf("❌ Failed to store REC1 record: %v", err)
+				continue
 			}
-			rec1Read++
-		}
-		if err != nil {
-			logrus.Errorf("❌ Failed to reset PLC data: %v", err)
-		} else {
-			logrus.Info("🔄 PLC data reset complete")
 		}
 	}
 	return nil
@@ -224,17 +174,12 @@ func isRecordEmpty(data []uint16) bool {
 }
 
 func storeMasterDB(rec0 []uint16, machineMasterId int) (*models.MasterData, error) {
-	logrus.Printf("✅ Stored Record: %04d-%02d-%02d %02d:%02d:%02d | Temp: %d | Humidity: %d\n",
-		rec0[0], rec0[1], rec0[2], rec0[3], rec0[4], rec0[5],
-		rec0[6], rec0[8],
-	)
-
 	tempSet := int(rec0[6])
 	humSet := int(rec0[7])
 	tempAct := int(rec0[8])
 	humAct := int(rec0[9])
-
-	mastersData := &models.MasterData{
+	var existingRecord models.MasterData
+	err := databases.DiantaDB.Where(&models.MasterData{
 		MachineMasterID: machineMasterId,
 		MachineYear:     int(rec0[0]),
 		MachineMonth:    int(rec0[1]),
@@ -242,11 +187,37 @@ func storeMasterDB(rec0 []uint16, machineMasterId int) (*models.MasterData, erro
 		MachineHour:     int(rec0[3]),
 		MachineMinute:   int(rec0[4]),
 		MachineSecond:   int(rec0[5]),
-		TempSet:         &tempSet,
-		HumSet:          &humSet,
-		TempAct:         &tempAct,
-		HumAct:          &humAct,
+	}).First(&existingRecord).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		mastersData := &models.MasterData{
+			MachineMasterID: machineMasterId,
+			MachineYear:     int(rec0[0]),
+			MachineMonth:    int(rec0[1]),
+			MachineDay:      int(rec0[2]),
+			MachineHour:     int(rec0[3]),
+			MachineMinute:   int(rec0[4]),
+			MachineSecond:   int(rec0[5]),
+			TempSet:         &tempSet,
+			HumSet:          &humSet,
+			TempAct:         &tempAct,
+			HumAct:          &humAct,
+		}
+		err := databases.DiantaDB.Save(&mastersData).Error
+		if err != nil {
+			logrus.Errorf("Unable to Store Record %v", err)
+			return nil, err
+		}
+		logrus.Printf("✅ Stored Record: %04d-%02d-%02d %02d:%02d:%02d | Temp: %d | Humidity: %d\n",
+			rec0[0], rec0[1], rec0[2], rec0[3], rec0[4], rec0[5],
+			rec0[6], rec0[8],
+		)
+		return mastersData, err
+	} else if err != nil {
+		return nil, err
 	}
-	err := databases.DiantaDB.Save(&mastersData).Error
-	return mastersData, err
+	logrus.Printf("⚠️ Record Already Exists for : %04d-%02d-%02d %02d:%02d:%02d | Temp: %d | Humidity: %d\n",
+		rec0[0], rec0[1], rec0[2], rec0[3], rec0[4], rec0[5],
+		rec0[6], rec0[8],
+	)
+	return &existingRecord, err
 }
